@@ -18,6 +18,17 @@ use work.vhsnunzip_int_pkg.all;
 -- The flattened output (c1_0 then c1_1 where present) is identical to the
 -- single-issue partial-command sequence, which the standalone testbench checks
 -- against c1.tv.
+--
+-- 200 MHz restructure (dpu-smartssd-olap 20261005-decoder-timing-fix-01,
+-- findings.md section 10): the element slots were loaded from the input and
+-- processed in the same cycle, putting the load multiplexer (select fanout to
+-- both slots) in front of the copy-split arithmetic (e0 -> c1h failed by 0.22 ns
+-- on the xczu7ev proxy). A one-entry skid register (ib) now holds an accepted
+-- transfer, and the slots are refilled at the end of a cycle from ib or from the
+-- transfer accepted that cycle, so slot processing starts from registers. The
+-- slot-1 facts (single chunk, run-length) are computed at refill. The output
+-- sequence and grouping are unchanged; a transfer reaches c1 one cycle later
+-- when the stage was idle.
 entity vhsnunzip_cmd_gen_1_dual is
   port (
     clk         : in  std_logic;
@@ -78,13 +89,28 @@ architecture behavior of vhsnunzip_cmd_gen_1_dual is
     return c;
   end function;
 
+  -- Initial remaining copy length of a lead element (diminished-one; -1 = none).
+  function cp_rem_init(e : element_stream) return signed is
+  begin
+    if e.valid = '1' and e.cp_val = '1' then
+      return signed(resize(e.cp_len, 7));
+    end if;
+    return to_signed(-1, 7);
+  end function;
+
 begin
   proc: process (clk) is
 
-    -- Element holding registers: e0 is the lead (slot 0, may be mid-split); e1
-    -- is the lookahead (slot 1 candidate).
+    -- Element slots: e0 is the lead (slot 0, may be mid-split); e1 is the
+    -- lookahead (slot 1 candidate). ib is the skid register.
     variable e0     : element_stream := ELEMENT_STREAM_INIT;
     variable e1     : element_stream := ELEMENT_STREAM_INIT;
+    variable ib     : dual_element_stream := DUAL_ELEMENT_STREAM_INIT;
+    variable el_rdy : std_logic := '0';
+
+    -- Facts about e1, computed at refill: single-chunk, and its partial command.
+    variable e1_simple : std_logic := '0';
+    variable e1_c1     : partial_command_stream := PARTIAL_COMMAND_STREAM_INIT;
 
     -- Remaining copy length of e0, diminished-one; sign bit = inverted validity.
     variable cp_rem : signed(6 downto 0) := (others => '1');
@@ -94,25 +120,21 @@ begin
 
     variable chunk  : signed(C_CNT-1 downto 0);
     variable adv0   : boolean;
+    variable acc    : boolean;
+    variable take   : boolean;
+    variable src    : dual_element_stream;
 
   begin
     if rising_edge(clk) then
+
+      -- The producer saw el_ready = el_rdy this cycle, so a valid transfer is
+      -- taken now (into the slots or the skid register below).
+      acc := el_rdy = '1' and el.el0.valid = '1';
 
       -- Invalidate the output register if it was shifted out.
       if c1_ready = '1' then
         c1h.c1_0.valid := '0';
         c1h.c1_1.valid := '0';
-      end if;
-
-      -- Latch a fresh dual transfer when both element slots are free.
-      if e0.valid = '0' and e1.valid = '0' then
-        e0 := el.el0;
-        e1 := el.el1;
-        if el.el0.valid = '1' and el.el0.cp_val = '1' then
-          cp_rem := signed(resize(el.el0.cp_len, 7));
-        else
-          cp_rem := (others => '1');
-        end if;
       end if;
 
       -- Process slot 0 when we have a lead element and the output is free.
@@ -155,20 +177,16 @@ begin
 
         -- Slot 1 / element advance.
         if adv0 then
-          if e1.valid = '1' and simple_copy(e1) then
+          if e1.valid = '1' and e1_simple = '1' then
             -- Co-issue the next element as a single partial command.
-            c1h.c1_1 := simple_c1(e1);
+            c1h.c1_1 := e1_c1;
             e0.valid := '0';
             e1.valid := '0';
           else
             -- Cannot pair; shift the lookahead into the lead slot.
             c1h.c1_1.valid := '0';
             e0 := e1;
-            if e1.valid = '1' and e1.cp_val = '1' then
-              cp_rem := signed(resize(e1.cp_len, 7));
-            else
-              cp_rem := (others => '1');
-            end if;
+            cp_rem := cp_rem_init(e1);
             e1.valid := '0';
           end if;
         else
@@ -177,21 +195,50 @@ begin
 
       end if;
 
+      -- Refill both element slots from registers once they are free.
+      take := false;
+      if e0.valid = '0' and e1.valid = '0' then
+        if ib.el0.valid = '1' then
+          src := ib;
+          ib.el0.valid := '0';
+          take := true;
+        elsif acc then
+          src := el;
+          acc := false;
+          take := true;
+        end if;
+      end if;
+      if take then
+        e0 := src.el0;
+        e1 := src.el1;
+        cp_rem := cp_rem_init(src.el0);
+        if simple_copy(src.el1) then
+          e1_simple := '1';
+        else
+          e1_simple := '0';
+        end if;
+        e1_c1 := simple_c1(src.el1);
+      end if;
+      if acc then
+        ib := el;
+      end if;
+
       -- Handle reset.
       if reset = '1' then
         e0.valid := '0';
         e1.valid := '0';
+        ib.el0.valid := '0';
         c1h.c1_0.valid := '0';
         c1h.c1_1.valid := '0';
         cp_rem := (others => '1');
       end if;
 
-      -- Assign outputs.
-      if e0.valid = '0' and e1.valid = '0' then
-        el_ready <= '1';
-      else
-        el_ready <= '0';
+      -- Assign outputs. el_ready is registered: the skid register is free.
+      el_rdy := not ib.el0.valid;
+      if reset = '1' then
+        el_rdy := '0';
       end if;
+      el_ready <= el_rdy;
       c1 <= c1h;
 
     end if;

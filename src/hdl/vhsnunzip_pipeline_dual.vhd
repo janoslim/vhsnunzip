@@ -37,6 +37,28 @@ use work.vhsnunzip_int_pkg.all;
 -- it unchanged, and a fold is never the chunk's last command, so the trailing-
 -- line / last-pending handling only ever runs in the cm0-only (cm1 invalid)
 -- case, which reduces exactly to single-issue.
+--
+-- 200 MHz restructure (dpu-smartssd-olap 20261005-decoder-timing-fix-01,
+-- findings.md section 10). The original s2 chained, in one cycle, the
+-- short-term SRL read (combinational address), cm0's copy-source mux and
+-- rotator, the forward overlay, cm1's copy-source mux and rotator, the merge
+-- and the SRL write: 11-13 logic levels, the worst decoder path (-0.64 ns on
+-- the xczu7ev proxy). It is now two stages with identical output bytes:
+--
+--  * stage r (the old s2 cycle) reads the literal and short-term SRLs and
+--    registers them together with the long-term read data. The command in
+--    stage x pushes its lanes at the end of this same cycle, so short-term
+--    reads in lanes it writes are taken one entry deeper, and index 0 of such
+--    a lane (that command's own output) is taken from s3_hold_data, which holds
+--    the last byte pushed into every lane. Stage r also composes cm1's forward
+--    overlay into cm0's sources: a cm1 lane b whose copy reads cm0's lane
+--    k = rol1(b) + b gets cm0's select for lane k, so one rotator per command
+--    remains and no rotator feeds another.
+--  * stage x mixes the registered sources (4:1), rotates (one 32:1 per command
+--    and lane), merges, and writes the SRLs and the holding/output registers.
+--
+-- Each stage-2 command now reaches the output one cycle later; the end-of-chunk
+-- stall after s2_last still leaves stage x empty when s3_last_pend flushes.
 entity vhsnunzip_pipeline_dual is
   generic (
     LONG_CHUNKS : boolean := true;
@@ -188,34 +210,63 @@ architecture behavior of vhsnunzip_pipeline_dual is
   signal s2_st_data0  : byte_array(0 to C_BYTES-1);
   signal s2_st_addr1  : srl_addr_array(0 to C_BYTES-1);
   signal s2_st_dataB  : byte_array(0 to C_BYTES-1);
-  signal s2_st_data1  : byte_array(0 to C_BYTES-1);
 
-  -- Long-term memory data (cm0 read port, and the mirrored cm1 read port).
-  signal s2_le_data   : byte_array(0 to C_BYTES-1);
-  signal s2_lo_data   : byte_array(0 to C_BYTES-1);
-  signal s2_le_data1  : byte_array(0 to C_BYTES-1);
-  signal s2_lo_data1  : byte_array(0 to C_BYTES-1);
-
-  -- cm0 copy-source mux and rotator.
+  -- cm0 copy-source and rotator control (registered by s1).
   signal s2_lt_val    : std_logic;
   signal s2_lt_sel0   : std_logic_array(0 to C_BYTES-1);
-  signal s2_cp_data0  : byte_array(0 to C_BYTES-1);
   signal s2_rol_sel0  : rol_array(0 to C_BYTES-1);
   signal s2_mux_sel0  : std_logic_array(0 to C_BYTES-1);
-  signal s2_mux_data0 : byte_array(0 to C_BYTES-1);
 
-  -- cm1 copy-source (long-term read, or short-term + forward overlay) and rotator.
+  -- cm1 copy-source (long-term read, or short-term + forward overlay) and
+  -- rotator control (registered by s1).
   signal s2_lt_val1   : std_logic;
   signal s2_lt_sel1   : std_logic_array(0 to C_BYTES-1);
   signal s2_fwd1      : std_logic_array(0 to C_BYTES-1);
-  signal s2_cp_data1  : byte_array(0 to C_BYTES-1);
   signal s2_rol_sel1  : rol_array(0 to C_BYTES-1);
   signal s2_mux_sel1  : std_logic_array(0 to C_BYTES-1);
-  signal s2_mux_data1 : byte_array(0 to C_BYTES-1);
 
-  -- Per-lane "cm1 wrote this lane" select and merged mux data.
+  -- Per-lane "cm1 wrote this lane" select.
   signal s2_cm1_lane  : std_logic_array(0 to C_BYTES-1);
-  signal s2_mux_data  : byte_array(0 to C_BYTES-1);
+
+  -- Stage r: short-term read addresses adjusted for the push of the command in
+  -- stage x (see the header).
+  signal s2_st_rdad0  : srl_addr_array(0 to C_BYTES-1);
+  signal s2_st_rdad1  : srl_addr_array(0 to C_BYTES-1);
+
+  -- Stage r -> x registers. Copy-source codes per source lane: src_lt selects
+  -- long-term data, where src_alt selects the odd bank; otherwise src_alt
+  -- selects s3_hold_data over the short-term read.
+  signal x_valid      : std_logic := '0';
+  signal x_last       : std_logic := '0';
+  signal x_cnt        : unsigned(C_IDX-1 downto 0) := (others => '0');
+  signal x_int_strb   : std_logic_array(0 to C_BYTES-1) := (others => '0');
+  signal x_ext_strb   : std_logic_array(0 to C_BYTES-1) := (others => '0');
+  signal x_li_data0   : byte_array(0 to C_BYTES-1);
+  signal x_li_data1   : byte_array(0 to C_BYTES-1);
+  signal x_st_data0   : byte_array(0 to C_BYTES-1);
+  signal x_st_dataB   : byte_array(0 to C_BYTES-1);
+  signal x_le_data0   : byte_array(0 to C_BYTES-1);
+  signal x_lo_data0   : byte_array(0 to C_BYTES-1);
+  signal x_le_data1   : byte_array(0 to C_BYTES-1);
+  signal x_lo_data1   : byte_array(0 to C_BYTES-1);
+  signal x_src_lt0    : std_logic_array(0 to C_BYTES-1);
+  signal x_src_alt0   : std_logic_array(0 to C_BYTES-1);
+  signal x_src_lt1    : std_logic_array(0 to C_BYTES-1);
+  signal x_src_alt1   : std_logic_array(0 to C_BYTES-1);
+
+  -- Per output lane: cm0-source rotator select (kind, index), which is cm1's
+  -- composed forward on a forwarded cm1 lane; cm1-source rotator select; and
+  -- whether the lane takes the cm1 source.
+  signal x_sel0_q     : std_logic_array(0 to C_BYTES-1);
+  signal x_sel0_r     : rol_array(0 to C_BYTES-1);
+  signal x_sel1_q     : std_logic_array(0 to C_BYTES-1);
+  signal x_sel1_r     : rol_array(0 to C_BYTES-1);
+  signal x_use1       : std_logic_array(0 to C_BYTES-1);
+
+  -- Stage x: copy sources and the merged lane data written this cycle.
+  signal x_cp_data0   : byte_array(0 to C_BYTES-1);
+  signal x_cp_data1   : byte_array(0 to C_BYTES-1);
+  signal x_mux_data   : byte_array(0 to C_BYTES-1);
 
   -- Merged byte strobes (feed the unchanged s2->s3 logic).
   signal s2_int_strb  : std_logic_array(0 to C_BYTES-1);
@@ -596,127 +647,190 @@ begin
   end process;
 
   -- Short-term memory SRLs (two read banks, written identically with the merged
-  -- push so each bank holds the same history).
+  -- push so each bank holds the same history). Written by stage x, read by
+  -- stage r at the push-adjusted addresses.
   st_srl_gen: for byte in 0 to C_BYTES-1 generate
   begin
     srl_a_inst: vhsnunzip_srl
       generic map (WIDTH => 8, DEPTH_LOG2 => 5)
       port map (
-        clk => clk, wr_ena => s2_int_strb(byte), wr_data => s2_mux_data(byte),
-        rd_addr => s2_st_addr0(byte), rd_data => s2_st_data0(byte));
+        clk => clk, wr_ena => x_int_strb(byte), wr_data => x_mux_data(byte),
+        rd_addr => s2_st_rdad0(byte), rd_data => s2_st_data0(byte));
     srl_b_inst: vhsnunzip_srl
       generic map (WIDTH => 8, DEPTH_LOG2 => 5)
       port map (
-        clk => clk, wr_ena => s2_int_strb(byte), wr_data => s2_mux_data(byte),
-        rd_addr => s2_st_addr1(byte), rd_data => s2_st_dataB(byte));
+        clk => clk, wr_ena => x_int_strb(byte), wr_data => x_mux_data(byte),
+        rd_addr => s2_st_rdad1(byte), rd_data => s2_st_dataB(byte));
   end generate;
 
-  -- "Load" long-term memory data: cm0 from the primary read port, cm1 from the
-  -- mirror read port.
-  s2_le_data <= lt_rd_even;
-  s2_lo_data <= lt_rd_odd;
-  s2_le_data1 <= lt_rd_even1;
-  s2_lo_data1 <= lt_rd_odd1;
+  -- Stage r short-term read addresses. s2_st_addr0/1 index the history after
+  -- every earlier command's push; the command in stage x has not pushed yet,
+  -- so in its lanes that history is one entry deeper in the SRL right now.
+  -- (Index 0 of such a lane is that command's output: stage x takes it from
+  -- s3_hold_data, and the SRL read at index -1 is not used.)
+  s2_st_rdad_proc: process (s2_st_addr0, s2_st_addr1, x_int_strb) is
+  begin
+    for byte in 0 to C_BYTES-1 loop
+      if x_int_strb(byte) = '1' then
+        s2_st_rdad0(byte) <= s2_st_addr0(byte) - 1;
+        s2_st_rdad1(byte) <= s2_st_addr1(byte) - 1;
+      else
+        s2_st_rdad0(byte) <= s2_st_addr0(byte);
+        s2_st_rdad1(byte) <= s2_st_addr1(byte);
+      end if;
+    end loop;
+  end process;
 
-  -- cm0 copy-source multiplexer (short-term / long-term even / odd).
-  s2_cp_data0_proc: process (
-    s2_st_data0, s2_le_data, s2_lo_data, s2_lt_val, s2_lt_sel0
+  -- Stage r -> x registers: SRL and long-term read data, copy-source codes and
+  -- the composed rotator selects.
+  --
+  -- Composition. The original cm1 output for lane b was
+  --   M1(b) = mux_sel1(b) ? C1(k) : L1(k),  k = rol_sel1(b) + b,
+  --   C1(k) = lt_val1 ? LT1(k) : (fwd1(k) ? M0(k) : ST1(k)),
+  -- and M0(k) = mux_sel0(k) ? C0(r0(k)) : L0(r0(k)) with r0(k) = rol_sel0(k) + k.
+  -- So a cm1 lane with mux_sel1(b) and not lt_val1 and fwd1(k) is cm0's 32:1
+  -- selection with lane k's select; every other cm1 lane is cm1's own 32:1
+  -- selection without the overlay; cm0 lanes are unchanged.
+  r_reg_proc: process (clk) is
+    variable r0  : rol_array(0 to C_BYTES-1);
+    variable r1  : unsigned(C_IDX-1 downto 0);
+    variable k   : natural range 0 to C_BYTES-1;
+    variable fwd : std_logic;
+  begin
+    if rising_edge(clk) then
+
+      x_valid    <= s2_valid;
+      x_last     <= s2_last;
+      x_cnt      <= s2_cnt;
+      x_int_strb <= s2_int_strb;
+      x_ext_strb <= s2_ext_strb;
+      x_li_data0 <= s2_li_data0;
+      x_li_data1 <= s2_li_data1;
+      x_st_data0 <= s2_st_data0;
+      x_st_dataB <= s2_st_dataB;
+      x_le_data0 <= lt_rd_even;
+      x_lo_data0 <= lt_rd_odd;
+      x_le_data1 <= lt_rd_even1;
+      x_lo_data1 <= lt_rd_odd1;
+
+      for byte in 0 to C_BYTES-1 loop
+        r0(byte) := s2_rol_sel0(byte) + byte;
+      end loop;
+
+      for byte in 0 to C_BYTES-1 loop
+
+        -- Copy-source codes (same priority as the original copy-source muxes).
+        x_src_lt0(byte) <= s2_lt_val;
+        if s2_lt_val = '1' then
+          x_src_alt0(byte) <= s2_lt_sel0(byte);
+        elsif x_int_strb(byte) = '1' and s2_st_addr0(byte) = 0 then
+          x_src_alt0(byte) <= '1';
+        else
+          x_src_alt0(byte) <= '0';
+        end if;
+        x_src_lt1(byte) <= s2_lt_val1;
+        if s2_lt_val1 = '1' then
+          x_src_alt1(byte) <= s2_lt_sel1(byte);
+        elsif x_int_strb(byte) = '1' and s2_st_addr1(byte) = 0 then
+          x_src_alt1(byte) <= '1';
+        else
+          x_src_alt1(byte) <= '0';
+        end if;
+
+        -- Rotator selects.
+        r1 := s2_rol_sel1(byte) + byte;
+        k := to_integer(r1);
+        fwd := s2_mux_sel1(byte) and not s2_lt_val1 and s2_fwd1(k);
+        x_sel1_q(byte) <= s2_mux_sel1(byte);
+        x_sel1_r(byte) <= r1;
+        if s2_cm1_lane(byte) = '1' and fwd = '1' then
+          x_sel0_q(byte) <= s2_mux_sel0(k);
+          x_sel0_r(byte) <= r0(k);
+          x_use1(byte) <= '0';
+        else
+          x_sel0_q(byte) <= s2_mux_sel0(byte);
+          x_sel0_r(byte) <= r0(byte);
+          x_use1(byte) <= s2_cm1_lane(byte);
+        end if;
+
+      end loop;
+
+      if reset = '1' then
+        x_valid <= '0';
+        x_int_strb <= (others => '0');
+        x_ext_strb <= (others => '0');
+      end if;
+    end if;
+  end process;
+
+  -- Stage x copy sources: short-term read, the last byte pushed into the lane
+  -- (the stage-x push the stage-r read could not see), or long-term even/odd.
+  x_cp_proc: process (
+    x_src_lt0, x_src_alt0, x_src_lt1, x_src_alt1, x_st_data0, x_st_dataB,
+    x_le_data0, x_lo_data0, x_le_data1, x_lo_data1, s3_hold_data
   ) is
   begin
     for byte in 0 to C_BYTES-1 loop
-      if s2_lt_val = '0' then
-        s2_cp_data0(byte) <= s2_st_data0(byte);
-      elsif s2_lt_sel0(byte) = '0' then
-        s2_cp_data0(byte) <= s2_le_data(byte);
+      if x_src_lt0(byte) = '1' then
+        if x_src_alt0(byte) = '1' then
+          x_cp_data0(byte) <= x_lo_data0(byte);
+        else
+          x_cp_data0(byte) <= x_le_data0(byte);
+        end if;
+      elsif x_src_alt0(byte) = '1' then
+        x_cp_data0(byte) <= s3_hold_data(byte);
       else
-        s2_cp_data0(byte) <= s2_lo_data(byte);
+        x_cp_data0(byte) <= x_st_data0(byte);
+      end if;
+      if x_src_lt1(byte) = '1' then
+        if x_src_alt1(byte) = '1' then
+          x_cp_data1(byte) <= x_lo_data1(byte);
+        else
+          x_cp_data1(byte) <= x_le_data1(byte);
+        end if;
+      elsif x_src_alt1(byte) = '1' then
+        x_cp_data1(byte) <= s3_hold_data(byte);
+      else
+        x_cp_data1(byte) <= x_st_dataB(byte);
       end if;
     end loop;
   end process;
 
-  -- cm0 main multiplexer/rotator.
-  s2_mux_data0_proc: process (
-    s2_li_data0, s2_cp_data0, s2_rol_sel0, s2_mux_sel0
+  -- Stage x rotators and merge: one 32:1 selection per command and lane.
+  x_mux_proc: process (
+    x_cp_data0, x_cp_data1, x_li_data0, x_li_data1, x_sel0_q, x_sel0_r,
+    x_sel1_q, x_sel1_r, x_use1
   ) is
-    variable idx : unsigned(C_IDX-1 downto 0);
+    variable d0 : std_logic_vector(7 downto 0);
+    variable d1 : std_logic_vector(7 downto 0);
   begin
     for byte in 0 to C_BYTES-1 loop
-      idx := s2_rol_sel0(byte) + byte;
-      if s2_mux_sel0(byte) = '0' then
-        s2_mux_data0(byte) <= s2_li_data0(to_integer(idx));
+      if x_sel0_q(byte) = '1' then
+        d0 := x_cp_data0(to_integer(x_sel0_r(byte)));
       else
-        s2_mux_data0(byte) <= s2_cp_data0(to_integer(idx));
+        d0 := x_li_data0(to_integer(x_sel0_r(byte)));
+      end if;
+      if x_sel1_q(byte) = '1' then
+        d1 := x_cp_data1(to_integer(x_sel1_r(byte)));
+      else
+        d1 := x_li_data1(to_integer(x_sel1_r(byte)));
+      end if;
+      if x_use1(byte) = '1' then
+        x_mux_data(byte) <= d1;
+      else
+        x_mux_data(byte) <= d0;
       end if;
     end loop;
   end process;
 
-  -- cm1 short-term copy source: the clocked bank-B read, with command 0's
-  -- same-cycle output forwarded per lane (the RAW-hazard resolution).
-  s2_st_data1_proc: process (s2_fwd1, s2_mux_data0, s2_st_dataB) is
-  begin
-    for byte in 0 to C_BYTES-1 loop
-      if s2_fwd1(byte) = '1' then
-        s2_st_data1(byte) <= s2_mux_data0(byte);
-      else
-        s2_st_data1(byte) <= s2_st_dataB(byte);
-      end if;
-    end loop;
-  end process;
-
-  -- cm1 copy-source multiplexer: long-term even/odd (from the mirror read port)
-  -- when cm1 reads long-term, otherwise the short-term + forward overlay. A
-  -- long-term cm1 reads committed history, so there is no same-cycle RAW hazard
-  -- with cm0 and the forward overlay does not apply on those lanes.
-  s2_cp_data1_proc: process (
-    s2_lt_val1, s2_lt_sel1, s2_le_data1, s2_lo_data1, s2_st_data1
-  ) is
-  begin
-    for byte in 0 to C_BYTES-1 loop
-      if s2_lt_val1 = '0' then
-        s2_cp_data1(byte) <= s2_st_data1(byte);
-      elsif s2_lt_sel1(byte) = '0' then
-        s2_cp_data1(byte) <= s2_le_data1(byte);
-      else
-        s2_cp_data1(byte) <= s2_lo_data1(byte);
-      end if;
-    end loop;
-  end process;
-
-  -- cm1 main multiplexer/rotator.
-  s2_mux_data1_proc: process (
-    s2_li_data1, s2_cp_data1, s2_rol_sel1, s2_mux_sel1
-  ) is
-    variable idx : unsigned(C_IDX-1 downto 0);
-  begin
-    for byte in 0 to C_BYTES-1 loop
-      idx := s2_rol_sel1(byte) + byte;
-      if s2_mux_sel1(byte) = '0' then
-        s2_mux_data1(byte) <= s2_li_data1(to_integer(idx));
-      else
-        s2_mux_data1(byte) <= s2_cp_data1(to_integer(idx));
-      end if;
-    end loop;
-  end process;
-
-  -- Per-lane merge: cm1's lanes take its rotator output, the rest take cm0's.
-  s2_mux_merge_proc: process (s2_cm1_lane, s2_mux_data0, s2_mux_data1) is
-  begin
-    for byte in 0 to C_BYTES-1 loop
-      if s2_cm1_lane(byte) = '1' then
-        s2_mux_data(byte) <= s2_mux_data1(byte);
-      else
-        s2_mux_data(byte) <= s2_mux_data0(byte);
-      end if;
-    end loop;
-  end process;
-
-  -- Stage 2-3 registers: holding register + output line. Byte-identical to
-  -- vhsnunzip_pipeline; it consumes the merged strobes/mux data above.
+  -- Stage x-3 registers: holding register + output line. Byte-identical to
+  -- vhsnunzip_pipeline's s2->s3 logic, one stage later; s3_hold_data doubles as
+  -- the stage-r forward source above.
   s2_reg_proc: process (clk) is
   begin
     if rising_edge(clk) then
 
-      s3_cnt <= s2_cnt;
+      s3_cnt <= x_cnt;
 
       s3_out_push <= '0';
       s3_out_last <= '0';
@@ -724,11 +838,11 @@ begin
       s3_last_pend <= '0';
 
       for byte in 0 to C_BYTES-1 loop
-        if s2_valid = '1' and s2_int_strb(byte) = '1' then
-          s3_hold_data(byte) <= s2_mux_data(byte);
+        if x_valid = '1' and x_int_strb(byte) = '1' then
+          s3_hold_data(byte) <= x_mux_data(byte);
         end if;
-        if s2_ext_strb(byte) = '1' then
-          s3_out_data(byte) <= s2_mux_data(byte);
+        if x_ext_strb(byte) = '1' then
+          s3_out_data(byte) <= x_mux_data(byte);
         else
           s3_out_data(byte) <= s3_hold_data(byte);
         end if;
@@ -738,19 +852,19 @@ begin
         s3_out_push <= '1';
         s3_out_last <= '1';
         s3_out_cnt <= resize(s3_cnt, C_CNT);
-      elsif s2_valid = '1' then
-        if s2_last = '1' then
-          if s2_int_strb(0) = '1' and s2_ext_strb(0) = '0' then
+      elsif x_valid = '1' then
+        if x_last = '1' then
+          if x_int_strb(0) = '1' and x_ext_strb(0) = '0' then
             s3_out_push <= '1';
             s3_last_pend <= '1';
           else
             s3_out_push <= '1';
             s3_out_last <= '1';
-            if s2_ext_strb(C_BYTES-1) = '0' then
-              s3_out_cnt <= resize(s2_cnt, C_CNT);
+            if x_ext_strb(C_BYTES-1) = '0' then
+              s3_out_cnt <= resize(x_cnt, C_CNT);
             end if;
           end if;
-        elsif s2_ext_strb(C_BYTES-1) = '1' then
+        elsif x_ext_strb(C_BYTES-1) = '1' then
           s3_out_push <= '1';
         end if;
       end if;
