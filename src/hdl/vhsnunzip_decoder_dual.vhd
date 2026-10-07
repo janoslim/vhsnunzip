@@ -75,14 +75,15 @@ use work.vhsnunzip_int_pkg.all;
 --    becomes the head applies first/start at the end of that cycle.
 --  * at full coverage (SPEC_OFFSETS >= C_BYTES-2) the element-0 size test is
 --    always true for reachable states (comment at the test) and is dropped.
+--  * each decode slot also carries, per start offset, whether that element ends
+--    past the line (off_next > endi) and off_next - C_BYTES, computed by the
+--    decoders, so the recurrence has no compare or subtract after its lookups.
 --  * the decode-all stage writes a slot only if one was free at the start of the
 --    cycle, so its write enable (the CE of every cdd_dec bit) does not wait for
 --    stage 1's pop decision (hse_r1 proxy: off -> cdd_dec CE, 12 levels,
---    +0.030 ns, the worst vhsnunzip path). A slot freed by this cycle's pop is
---    refilled next cycle, while stage 1 already works on the other slot, so a
---    line still reaches stage 1 every cycle when stage 1 pops every cycle. This
---    is dec3's change on dec (patches/dec4/), without dec2's precomputed
---    crossing flags.
+--    +0.030 ns). A slot freed by this cycle's pop is refilled next cycle, while
+--    stage 1 already works on the other slot, so a line still reaches stage 1
+--    every cycle when stage 1 pops every cycle.
 --
 -- A line now reaches stage 1 one cycle later than before (through cdi).
 entity vhsnunzip_decoder_dual is
@@ -266,6 +267,15 @@ begin
     variable cdd_dec : cdd_dec_array_t(0 to CDD_DEPTH-1) :=
         (others => (others => DECODED_INIT));
 
+    -- Per slot and start offset: the element crosses the line (off_next > endi),
+    -- and its next offset relative to the following line (off_next - C_BYTES).
+    type cross_array_t is array (natural range <>) of std_logic_vector(0 to C_BYTES-1);
+    type next_array_t is array (natural range <>) of unsigned(16 downto 0);
+    type next_slot_array_t is array (natural range <>) of next_array_t(0 to C_BYTES-1);
+    variable cdd_cr  : cross_array_t(0 to CDD_DEPTH-1) := (others => (others => '0'));
+    variable cdd_om  : next_slot_array_t(0 to CDD_DEPTH-1) := (others => (others => (others => '0')));
+    variable dj      : decoded_t;
+
     -- Circular-FIFO read/write pointers (1-bit; wrap on +1 for CDD_DEPTH=2) and
     -- occupancy count. The pointer arithmetic below assumes a power-of-two depth.
     variable rp      : unsigned(0 downto 0) := (others => '0');
@@ -389,14 +399,14 @@ begin
             s1.empty0 := '0';
             s1.d0     := d0;
 
-            if off0 > hd.endi then
+            if cdd_cr(to_integer(rp))(to_integer(off(C_IDX-1 downto 0))) = '1' then
 
               -- Element 0 crosses the line; emit only element 0 and pull a new
               -- line. This is the single-issue case.
               s1.e0_pop  := '1';
               s1.e0_last := hd.last;
               s1.e1_val  := '0';
-              off := off0 - C_BYTES;
+              off := cdd_om(to_integer(rp))(to_integer(off(C_IDX-1 downto 0)));
               consumed := true;
 
             else
@@ -421,10 +431,10 @@ begin
                 s1.e1_val := '1';
                 s1.d1     := d1;
 
-                if d1.off_next > hd.endi then
+                if cdd_cr(to_integer(rp))(to_integer(off0(C_IDX-1 downto 0))) = '1' then
                   s1.e1_pop  := '1';
                   s1.e1_last := hd.last;
-                  off := d1.off_next - C_BYTES;
+                  off := cdd_om(to_integer(rp))(to_integer(off0(C_IDX-1 downto 0)));
                   consumed := true;
                 else
                   s1.e1_pop  := '0';
@@ -464,8 +474,14 @@ begin
       if cdi.valid = '1' and count0 < CDD_DEPTH then
         cdd(to_integer(wp)) := cdi;
         for j in 0 to C_BYTES-1 loop
-          cdd_dec(to_integer(wp))(j) :=
-              decode_one(cdi.data, to_unsigned(j, off'length), cdi.endi);
+          dj := decode_one(cdi.data, to_unsigned(j, off'length), cdi.endi);
+          cdd_dec(to_integer(wp))(j) := dj;
+          if dj.off_next > cdi.endi then
+            cdd_cr(to_integer(wp))(j) := '1';
+          else
+            cdd_cr(to_integer(wp))(j) := '0';
+          end if;
+          cdd_om(to_integer(wp))(j) := dj.off_next - C_BYTES;
         end loop;
         wp    := wp + 1;
         count := count + 1;
