@@ -40,6 +40,30 @@ use work.vhsnunzip_int_pkg.all;
 --
 -- Commands reach cm two cycles later than before; the order, grouping into
 -- {cm0, cm1} and every field are unchanged.
+--
+-- rd6 (decoder-timing-fix findings.md section 13). In the v09 full-design link
+-- (run-v09-v2-rd5-01) this block failed by 0.173 ns: proc.s0_reg[cp_len] ->
+-- proc.s1_b1_reg / proc.s1_simp_reg, 11-13 levels. The lead's copy length went
+-- through the load_new mux, the literal budget compare, len0, b0 and the
+-- co-issue sum b0 + s1_b1 <= C_BYTES into advance/fold and the refill decision
+-- (fanout 98), and the refill then added s1_b1's adder or simple_cmd's compare
+-- behind the source mux. The xczu7ev proxy showed the same structure as the
+-- block's worst paths (+0.414 ns, c1_pend -> s1_simp, 13 levels; +0.488 ns,
+-- c1_pend -> lt_ptr, 12 levels; rd-analysis/v09-hse_r4_rd5-01). Two changes,
+-- both leaving every register value, and so the command sequence and its
+-- timing, as before:
+--
+--  * lead_facts: what stage A derives from a partial command in the cycle it
+--    starts as the lead (load_new = 1, the running literal has finished) depends
+--    only on that command. It is computed where the command enters a slot (from
+--    the producer's output register for a direct refill, or when the skid
+--    register loads) and kept beside the slot, so stage A only selects between
+--    it and the continuing-literal case, whose copy is empty and whose budget is
+--    the constant C_BYTES; that case's "li_len < C_BYTES" test is a register
+--    (li_small) updated with li_len.
+--  * The slot-1 facts the refill derives (simple, byte count, b1) and the pair's
+--    co-issue fit are computed the same way, in front of the source mux, so the
+--    refill decision is followed by a 2:1 select only.
 entity vhsnunzip_cmd_gen_2_dual is
   generic (
     LONG_CHUNKS : boolean := true
@@ -177,15 +201,135 @@ architecture behavior of vhsnunzip_cmd_gen_2_dual is
     return to_unsigned(0, C_CNT);
   end function;
 
+  -- rd6: what stage A derives from a partial command in the cycle it starts as
+  -- the lead (load_new = 1, so li_len = -1: a command without a literal leads
+  -- with lil = -1), computed where the command enters a slot. Field by field it
+  -- is the original stage A's value in that cycle: done, cross, len0 and b0, and
+  -- small = li_small of the li_len stage A leaves behind.
+  type lead_facts is record
+    done  : std_logic;
+    cross : std_logic;
+    len0  : unsigned(C_CNT-1 downto 0);
+    b0    : unsigned(C_CNT downto 0);
+    small : std_logic;
+  end record;
+
+  constant LEAD_FACTS_INIT : lead_facts := (
+    done  => '0',
+    cross => '0',
+    len0  => (others => '0'),
+    b0    => (others => '0'),
+    small => '0'
+  );
+
+  -- rd6: the facts of a transfer {c1_0, c1_1} that the refill used to derive
+  -- behind the source mux: lead facts of both commands (c1_1 leads after a
+  -- shift), slot 1's simple flag, byte count and b1, the co-issue fit of the pair
+  -- in c1_0's first cycle (b0 + s1_b1 <= C_BYTES), and c1_pend after a refill.
+  type pair_facts is record
+    n0    : lead_facts;
+    n1    : lead_facts;
+    simp1 : std_logic;
+    cnt1  : unsigned(C_CNT-1 downto 0);
+    b1    : unsigned(C_CNT downto 0);
+    fold  : std_logic;
+    pend0 : std_logic;
+  end record;
+
+  constant PAIR_FACTS_INIT : pair_facts := (
+    n0    => LEAD_FACTS_INIT,
+    n1    => LEAD_FACTS_INIT,
+    simp1 => '0',
+    cnt1  => (others => '0'),
+    b1    => (others => '0'),
+    fold  => '0',
+    pend0 => '0'
+  );
+
+  function lead(c : partial_command_stream) return lead_facts is
+    variable f        : lead_facts;
+    variable budget   : unsigned(C_CNT-1 downto 0);
+    variable lil      : signed(li_high_fn downto 0);
+    variable lzero    : std_logic;
+    variable lt_small : std_logic;
+    variable rest     : signed(li_high_fn downto 0);
+  begin
+    budget := unsigned(c.cp_len) xor to_unsigned(C_BYTES-1, C_CNT);
+    if c.li_val = '1' then
+      lil := signed(resize(c.li_len, li_high_fn + 1));
+      lzero := li_upper_zero(c);
+    else
+      lil := (others => '1');
+      lzero := '0';
+    end if;
+    if lil(lil'high) = '1' or (lzero = '1' and unsigned(lil(C_CNT-1 downto 0)) < budget) then
+      lt_small := '1';
+    else
+      lt_small := '0';
+    end if;
+    if c.li_off(C_IDX) = '1' then
+      f.len0 := (others => '0');
+      f.done := lil(lil'high);
+      f.cross := '1';
+      rest := lil;
+    else
+      if lt_small = '1' then
+        f.len0 := unsigned(lil(C_CNT-1 downto 0)) + 1;
+      else
+        f.len0 := budget;
+      end if;
+      f.done := lt_small;
+      if resize(c.li_off, C_CNT+1) + resize(budget, C_CNT+1) >= C_BYTES then
+        f.cross := '1';
+      else
+        f.cross := '0';
+      end if;
+      rest := lil - signed(resize(budget, li_high_fn + 1));
+    end if;
+    f.b0 := resize(unsigned(c.cp_len) + 1, C_CNT+1) + resize(f.len0, C_CNT+1);
+    -- li_len after the cycle is -1 when done, else rest.
+    if f.done = '1' or rest(rest'high) = '1' or rest(rest'high-1 downto C_IDX) = 0 then
+      f.small := '1';
+    else
+      f.small := '0';
+    end if;
+    return f;
+  end function;
+
+  function pair(c : dual_partial_command_stream) return pair_facts is
+    variable p : pair_facts;
+  begin
+    p.n0 := lead(c.c1_0);
+    p.n1 := lead(c.c1_1);
+    if simple_cmd(c.c1_1) then
+      p.simp1 := '1';
+    else
+      p.simp1 := '0';
+    end if;
+    p.cnt1 := simple_li_cnt(c.c1_1);
+    p.b1 := resize(unsigned(c.c1_1.cp_len) + 1, C_CNT+1) + resize(simple_li_cnt(c.c1_1), C_CNT+1);
+    if p.n0.b0 + p.b1 <= C_BYTES then
+      p.fold := '1';
+    else
+      p.fold := '0';
+    end if;
+    p.pend0 := (not c.c1_0.cp_len(C_CNT-1)) or c.c1_0.li_val;
+    return p;
+  end function;
+
 begin
   proc: process (clk) is
 
-    -- Input skid register, the two slots, and the facts computed at refill.
+    -- Input skid register, the two slots, and the facts computed where a
+    -- transfer enters them (rd6: ibf with the skid register, s0n/s1n/s01_fold
+    -- and the s1_* facts with the slots).
     variable ib       : dual_partial_command_stream := DUAL_PARTIAL_COMMAND_STREAM_INIT;
+    variable ibf      : pair_facts := PAIR_FACTS_INIT;
     variable s0       : partial_command_stream := PARTIAL_COMMAND_STREAM_INIT;
     variable s1       : partial_command_stream := PARTIAL_COMMAND_STREAM_INIT;
-    variable s0_lz    : std_logic := '0';
-    variable s1_lz    : std_logic := '0';
+    variable s0n      : lead_facts := LEAD_FACTS_INIT;
+    variable s1n      : lead_facts := LEAD_FACTS_INIT;
+    variable s01_fold : std_logic := '0';
     variable s1_simp  : std_logic := '0';
     variable s1_cnt   : unsigned(C_CNT-1 downto 0) := (others => '0');
     variable s1_b1    : unsigned(C_CNT downto 0) := (others => '0');
@@ -196,6 +340,9 @@ begin
     variable lt_ptr   : unsigned(C_AW downto 0);
     variable c1_pend  : std_logic;
     variable li_len   : signed(li_high_fn downto 0) := (others => '1');
+    -- rd6: li_len < C_BYTES or li_len = -1, i.e. the original's lt_small for a
+    -- continuing literal (no copy, budget C_BYTES); written with li_len.
+    variable li_small : std_logic := '1';
     variable li_off   : unsigned(C_WIN-1 downto 0);
     variable off      : unsigned(C_CNT-1 downto 0);
 
@@ -203,17 +350,17 @@ begin
     variable load_new : std_logic;
     variable pend     : std_logic;
     variable cpl      : signed(C_CNT-1 downto 0);
-    variable lil      : signed(li_high_fn downto 0);
     variable lio      : unsigned(C_WIN-1 downto 0);
-    variable lzero    : std_logic;
-    variable budget   : unsigned(C_CNT-1 downto 0);
-    variable cp1      : unsigned(C_CNT-1 downto 0);
-    variable lp1      : unsigned(C_CNT-1 downto 0);
-    variable lt_small : std_logic;
+    variable c_len0   : unsigned(C_CNT-1 downto 0);
+    variable c_done   : std_logic;
+    variable c_rest   : signed(li_high_fn downto 0);
+    variable c_small  : std_logic;
+    variable c_fit    : std_logic;
     variable done     : std_logic;
     variable cross    : std_logic;
     variable len0     : unsigned(C_CNT-1 downto 0);
     variable b0       : unsigned(C_CNT downto 0);
+    variable fit      : std_logic;
     variable sum      : unsigned(C_CNT downto 0);
     variable sum2     : unsigned(C_CNT downto 0);
     variable off1     : unsigned(C_CNT-1 downto 0);
@@ -224,6 +371,8 @@ begin
     -- Refill temporaries.
     variable acc      : boolean;
     variable src      : dual_partial_command_stream;
+    variable srcf     : pair_facts;
+    variable c1f      : pair_facts;
     variable take     : boolean;
 
     -- Stage A -> B raw register and stage B output register.
@@ -265,58 +414,86 @@ begin
         -- then slot 0 continues that literal (cp_len -1, carried li_len/li_off).
         load_new := li_len(li_len'high) and c1_pend;
         pend := c1_pend and not li_len(li_len'high);
-        if load_new = '1' then
-          cpl := s0.cp_len;
-          lio := s0.li_off;
-          if s0.li_val = '1' then
-            lil := signed(resize(s0.li_len, li_len'length));
-            lzero := s0_lz;
+
+        -- rd6: the continuing case (load_new = 0). The copy is empty (cp1 = 0) and
+        -- the budget is C_BYTES, so the original's lt_small is li_small, len0 is
+        -- li_len + 1 or C_BYTES, and cross is 1 (li_off + C_BYTES >= C_BYTES).
+        if li_off(C_IDX) = '1' then
+          c_len0 := (others => '0');
+          c_done := li_len(li_len'high);
+          c_rest := li_len;
+          c_small := li_small;
+        else
+          if li_small = '1' then
+            c_len0 := unsigned(li_len(C_CNT-1 downto 0)) + 1;
           else
-            lil := li_len;
-            lzero := '0';
+            c_len0 := to_unsigned(C_BYTES, C_CNT);
+          end if;
+          c_done := li_small;
+          c_rest := li_len - C_BYTES;
+          -- When it does not finish, li_len >= C_BYTES, and li_len - C_BYTES <
+          -- C_BYTES is li_len < 2 * C_BYTES.
+          if li_len(li_len'high-1 downto C_IDX+1) = 0 then
+            c_small := '1';
+          else
+            c_small := '0';
+          end if;
+        end if;
+        -- Its co-issue fit b0 + s1_b1 <= C_BYTES matters only when c_done; then
+        -- b0 = c_len0 is 0 (li_off(C_IDX) set, or li_len = -1) or li_len + 1 with
+        -- 0 <= li_len < C_BYTES.
+        if li_off(C_IDX) = '1' or li_len(li_len'high) = '1' then
+          if s1_b1 <= C_BYTES then
+            c_fit := '1';
+          else
+            c_fit := '0';
           end if;
         else
-          cpl := (others => '1');
-          lio := li_off;
-          lil := li_len;
-          if li_len(li_len'high-1 downto C_CNT) = 0 then
-            lzero := '1';
+          if resize(unsigned(li_len(C_IDX-1 downto 0)), C_CNT+1) + s1_b1 < C_BYTES then
+            c_fit := '1';
           else
-            lzero := '0';
+            c_fit := '0';
           end if;
         end if;
 
-        -- Literal bytes this cycle. li_len < budget (li_len'high-bit compare in
-        -- the original) is: negative, or upper bits zero and the 5-bit compare.
-        budget := unsigned(cpl) xor to_unsigned(C_BYTES-1, C_CNT);
-        cp1 := unsigned(cpl) + 1;
-        lp1 := unsigned(lil(C_CNT-1 downto 0)) + 1;
-        if lil(lil'high) = '1' or (lzero = '1' and unsigned(lil(C_CNT-1 downto 0)) < budget) then
-          lt_small := '1';
+        -- rd6: the lead case reads the facts held with slot 0 (lead_facts).
+        if load_new = '1' then
+          cpl := s0.cp_len;
+          lio := s0.li_off;
+          done := s0n.done;
+          cross := s0n.cross;
+          len0 := s0n.len0;
+          b0 := s0n.b0;
+          fit := s01_fold;
+          -- The literal state after this cycle (li_len - len0 of the original);
+          -- a lead without a literal is done.
+          if s0n.done = '1' then
+            li_len := (others => '1');
+          elsif s0.li_off(C_IDX) = '1' then
+            li_len := signed(resize(s0.li_len, li_len'length));
+          else
+            li_len := signed(resize(s0.li_len, li_len'length))
+                      - signed(resize(unsigned(s0.cp_len) xor to_unsigned(C_BYTES-1, C_CNT), li_len'length));
+          end if;
+          li_small := s0n.small;
         else
-          lt_small := '0';
-        end if;
-        if lio(C_IDX) = '1' then
-          len0 := (others => '0');
-          done := lil(lil'high);
+          cpl := (others => '1');
+          lio := li_off;
+          done := c_done;
           cross := '1';
-        else
-          if lt_small = '1' then
-            len0 := lp1;
+          len0 := c_len0;
+          b0 := resize(c_len0, C_CNT+1);
+          fit := c_fit;
+          if c_done = '1' then
+            li_len := (others => '1');
           else
-            len0 := budget;
+            li_len := c_rest;
           end if;
-          done := lt_small;
-          if resize(lio, C_CNT+1) + resize(budget, C_CNT+1) >= C_BYTES then
-            cross := '1';
-          else
-            cross := '0';
-          end if;
+          li_small := c_done or c_small;
         end if;
 
         -- Bytes slot 0 writes (at most C_BYTES), the advanced offset and line
         -- pointer, and the raw command.
-        b0 := resize(cp1, C_CNT+1) + resize(len0, C_CNT+1);
         sum := resize(off, C_CNT+1) + b0;
         off1 := sum(C_CNT-1 downto 0);
         off1(C_IDX) := '0';
@@ -336,14 +513,6 @@ begin
         cmr0.li_cnt := len0;
         cmr1.valid  := '0';
 
-        -- The literal state after this cycle (li_len - len0 of the original).
-        if done = '1' then
-          li_len := (others => '1');
-        elsif lio(C_IDX) = '1' then
-          li_len := lil;
-        else
-          li_len := lil - signed(resize(budget, li_len'length));
-        end if;
         li_off := lio + len0;
         off := off1;
         lt_ptr := lt_ptr1;
@@ -361,9 +530,10 @@ begin
           end if;
 
           -- Slot 1: co-issue when the lead retired fully, is not last, the
-          -- lookahead is simple, and the pair writes at most one line.
+          -- lookahead is simple, and the pair writes at most one line (rd6:
+          -- fit = b0 + s1_b1 <= C_BYTES, precomputed per case above).
           fold := done = '1' and s0.last = '0' and s1.valid = '1' and s1_simp = '1'
-                  and b0 + s1_b1 <= C_BYTES;
+                  and fit = '1';
           if fold then
             cmr1.valid  := '1';
             cmr1.off    := off1;
@@ -387,7 +557,7 @@ begin
             -- Shift the lookahead into the lead slot (deferred to its own
             -- cycle, or keeping any carried literal state).
             s0 := s1;
-            s0_lz := s1_lz;
+            s0n := s1n;
             if s1.valid = '1' then
               c1_pend := (not s1.cp_len(C_CNT-1)) or s1.li_val;
             end if;
@@ -407,14 +577,19 @@ begin
       end if;
 
       -- ================= Refill the slots from registers ====================
+      -- rd6: the facts of the producer's transfer, for a direct refill and for
+      -- the skid register (pair_facts).
+      c1f := pair(c1);
       take := false;
       if s0.valid = '0' and s1.valid = '0' and lt_val = '1' then
         if ib.c1_0.valid = '1' then
           src := ib;
+          srcf := ibf;
           ib.c1_0.valid := '0';
           take := true;
         elsif acc then
           src := c1;
+          srcf := c1f;
           acc := false;
           take := true;
         end if;
@@ -422,19 +597,17 @@ begin
       if take then
         s0 := src.c1_0;
         s1 := src.c1_1;
-        s0_lz := li_upper_zero(src.c1_0);
-        s1_lz := li_upper_zero(src.c1_1);
-        if simple_cmd(src.c1_1) then
-          s1_simp := '1';
-        else
-          s1_simp := '0';
-        end if;
-        s1_cnt := simple_li_cnt(src.c1_1);
-        s1_b1 := resize(unsigned(src.c1_1.cp_len) + 1, C_CNT+1) + resize(simple_li_cnt(src.c1_1), C_CNT+1);
-        c1_pend := (not src.c1_0.cp_len(C_CNT-1)) or src.c1_0.li_val;
+        s0n := srcf.n0;
+        s1n := srcf.n1;
+        s01_fold := srcf.fold;
+        s1_simp := srcf.simp1;
+        s1_cnt := srcf.cnt1;
+        s1_b1 := srcf.b1;
+        c1_pend := srcf.pend0;
       end if;
       if acc then
         ib := c1;
+        ibf := c1f;
       end if;
 
       -- Handle reset.
@@ -449,6 +622,7 @@ begin
         lt_val := '0';
         c1_pend := '0';
         li_len := (others => '1');
+        li_small := '1';
         off := (others => '0');
       end if;
 
